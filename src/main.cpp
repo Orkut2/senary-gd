@@ -15,6 +15,7 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/LevelInfoLayer.hpp>
 
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -181,15 +182,15 @@ static void setSenaryString(CCLabelBMFont* label, std::string const& s) {
 // --- global backbone ------------------------------------------------------
 
 class $modify(SenaryLabel, CCLabelBMFont) {
+    // Only one setString override may live here: Geode resolves the hook via
+    // &SenaryLabel::setString, which is ambiguous if the name is overloaded.
+    // The one-arg virtual is GD's canonical text entry point (the two-arg and
+    // unsigned short* overloads are reached through it), so this covers the
+    // common path; setCString is a distinct name and hooks independently.
     void setString(char const* str) {
         std::string out = senary::process(this, str);
         CCLabelBMFont::setString(out.c_str());
         if (senary::enabled()) senary::flipPernifGlyphs(this, out);
-    }
-    void setString(char const* str, bool needUpdateLabel) {
-        std::string out = senary::process(this, str);
-        CCLabelBMFont::setString(out.c_str(), needUpdateLabel);
-        if (senary::enabled() && needUpdateLabel) senary::flipPernifGlyphs(this, out);
     }
     void setCString(char const* str) {
         std::string out = senary::process(this, str);
