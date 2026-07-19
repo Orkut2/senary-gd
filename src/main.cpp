@@ -1,25 +1,34 @@
-// Senary Numbers — v0.2
+// Senary Numbers — v0.3.2 (second internal revision of the third compiled
+// test version; senary versioning: v0.5 rolls over to v1.0)
 //
-// Changes from v0.1:
-// - Coverage: global hook moved to the two-arg setString(char const*, bool)
-//   funnel (single override — Geode $modify cannot hold two overloads of one
-//   name) plus initWithString, so creation-time text (settings menu, pause
-//   menu, popups) is now intercepted. Geode hooks at the function address,
-//   so internal calls from the one-arg setString/setCString route through.
-// - Pernif sign: horizontal flip (setFlipX) — vertical flip inverted the
-//   glyph's baked drop shadow.
-// - New Best rework: fires only when a full new pernif is completed; best
-//   saves as floor(whole_pernif * 100/36) percent; popups suppressed for
-//   intra-pernif gains; popup percent semantically rescaled, not
-//   digit-converted.
-// - PlayLayer::resetLevel and PauseLayer::setupProgressBars hooks so the
-//   attempt-start label and pause-menu progress lines show pernifage.
+// Changes from v0.3.0/.1:
+// - Comma-grouped numbers ("178,540,243") parse as one value instead of
+//   per-group digit conversion; output is quartet-grouped senary.
+// - Vanilla K/M/B abbreviations re-abbreviate as unexians (U) / biexians
+//   (B), one rounded senary radix digit. Where the true count is available
+//   (LevelInfoLayer, LevelCell), labels are recomputed from the exact int;
+//   the string-level fallback handles everything else. Below unexian the
+//   full form always shows, even where vanilla abbreviated (1.1K -> 5032).
+// - Endscreen time is T6: SI seconds * 27/50 = T6 seconds, shown as senary
+//   h:mm:ss (ss always zero-padded, mm only when hours show), computed from the precise double
+//   m_gameState.m_levelTime, not the rounded label.
+// - Orb count labels hidden outside levels (LevelInfoLayer, LevelCell);
+//   in-level collection animation untouched.
+// - Labels inside CCTextInputNode are exempt from conversion — typed
+//   digits display as typed.
+// - LevelBrowserLayer's number popup (page jump etc.) reinterprets the
+//   typed digits as senary on the backend: typing 100 jumps to page 36x.
 
 #include <Geode/Geode.hpp>
+#include <Geode/binding/CCTextInputNode.hpp>
 #include <Geode/modify/CCLabelBMFont.hpp>
+#include <Geode/modify/CCCounterLabel.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/LevelInfoLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/EndLevelLayer.hpp>
+#include <Geode/modify/LevelCell.hpp>
+#include <Geode/modify/LevelBrowserLayer.hpp>
 
 #include <cctype>
 #include <cmath>
@@ -31,19 +40,8 @@ using namespace geode::prelude;
 
 namespace senary {
 
-// Set while a targeted hook writes an already-senary string, so the global
-// hook passes it through untouched.
 static bool s_bypass = false;
-
-// Set while showNewBest runs: digit runs immediately followed by '%' are
-// semantically rescaled (percent -> whole pernif) instead of digit-converted,
-// so the popup shows real pernifage. Other numbers (orbs etc.) still
-// digit-convert.
 static bool s_rescalePercentTokens = false;
-
-// Last string this mod wrote to each label; identical re-sets pass through
-// instead of being converted twice (senary output would be re-read as
-// decimal). Stale entries on address reuse cost at most one skipped frame.
 static std::unordered_map<CCLabelBMFont*, std::string> s_lastOutput;
 
 static bool enabled() {
@@ -63,17 +61,53 @@ static std::string toSenary(uint64_t v) {
     return out;
 }
 
+// Quartet grouping from the right: "10344213" -> "1034 4213".
+static std::string toSenaryGrouped(uint64_t v) {
+    std::string s = toSenary(v);
+    if (s.size() <= 4) return s;
+    std::string out;
+    size_t lead = s.size() % 4;
+    if (lead) out = s.substr(0, lead);
+    for (size_t i = lead; i < s.size(); i += 4) {
+        if (!out.empty()) out += ' ';
+        out += s.substr(i, 4);
+    }
+    return out;
+}
+
+static constexpr uint64_t UNEXIAN = 1296;      // 6^4
+static constexpr uint64_t BIEXIAN = 1679616;   // 6^8
+
+// Below unexian: full quartet-grouped senary, even where vanilla
+// abbreviated (the 1,000-1,295 in-between zone: "1.1K" -> 5032).
+// At unexian and above: "X.dU" / "X.dB", one senary radix digit, rounded.
+static std::string senaryAbbrev(double v) {
+    if (v < 0) v = 0;
+    if (v < static_cast<double>(UNEXIAN))
+        return toSenaryGrouped(static_cast<uint64_t>(std::llround(v)));
+    uint64_t base = (v >= static_cast<double>(BIEXIAN)) ? BIEXIAN : UNEXIAN;
+    char suffix = (base == BIEXIAN) ? 'B' : 'U';
+    uint64_t sixths = static_cast<uint64_t>(std::llround(v * 6.0 / static_cast<double>(base)));
+    if (suffix == 'U' && sixths >= 6 * UNEXIAN) { // rounded up across the boundary
+        base = BIEXIAN;
+        suffix = 'B';
+        sixths = static_cast<uint64_t>(std::llround(v * 6.0 / static_cast<double>(base)));
+    }
+    std::string s = toSenary(sixths / 6);
+    s += '.';
+    s += static_cast<char>('0' + sixths % 6);
+    s += suffix;
+    return s;
+}
+
 // --- pernif math ----------------------------------------------------------
 
-// Recover whole pernif from a stored best percent. Ceiling, not floor:
-// saved values are floor(n * 100/36); 5% * 36/100 = 1.8 means 2 pernif.
 static int pernifFromSavedPercent(int percent) {
     if (percent >= 100) return 36;
     if (percent <= 0) return 0;
     return static_cast<int>(std::ceil(percent * 36.0 / 100.0 - 1e-9));
 }
 
-// The percent value this mod saves for n whole pernif.
 static int savedPercentForPernif(int wholePernif) {
     if (wholePernif >= 36) return 100;
     if (wholePernif <= 0) return 0;
@@ -84,17 +118,12 @@ static bool isLegalSavedPercent(int p) {
     return savedPercentForPernif(pernifFromSavedPercent(p)) == p;
 }
 
-// Map an arbitrary (vanilla-written) percent onto the legal floored set.
-// Identity on already-legal values; raw values floor down (18 -> 6 whole
-// pernif -> 16).
 static int normalizeSavedPercent(int p) {
     if (isLegalSavedPercent(p)) return p;
     int whole = static_cast<int>(std::floor(p * 36.0 / 100.0 + 1e-9));
     return savedPercentForPernif(whole);
 }
 
-// percent (0..100) -> pernif display string, optionally with two floored
-// senary radix digits, computed from the raw fraction.
 static std::string formatPernif(double percent, bool radixDigits) {
     double f = percent / 100.0;
     if (f < 0) f = 0;
@@ -111,6 +140,28 @@ static std::string formatPernif(double percent, bool radixDigits) {
     }
     s += '%';
     return s;
+}
+
+// --- T6 time --------------------------------------------------------------
+
+// SI day = 86400 s; T6 day = 36h * 36min * 36s = 46656 T6-seconds.
+// T6 seconds = SI seconds * 46656/86400 = SI * 27/50, exactly.
+static std::string formatT6Time(double siSeconds) {
+    if (siSeconds < 0) siSeconds = 0;
+    double t6 = siSeconds * 27.0 / 50.0;
+    uint64_t total = static_cast<uint64_t>(std::floor(t6 + 1e-9));
+    uint64_t h = total / 1296;
+    uint64_t m = (total / 36) % 36;
+    uint64_t s = total % 36;
+    auto pad2 = [](uint64_t v) {
+        std::string d = toSenary(v);
+        return d.size() < 2 ? "0" + d : d;
+    };
+    std::string out;
+    if (h > 0) out = toSenary(h) + ":" + pad2(m);
+    else out = toSenary(m);
+    out += ":" + pad2(s);
+    return out;
 }
 
 // --- text conversion ------------------------------------------------------
@@ -135,6 +186,62 @@ static void replacePercentWords(std::string& s) {
     }
 }
 
+// Try to match a comma-grouped number at position i: \d{1,3}(,\d{3})+ with
+// standalone boundaries. On success sets value/end and returns true.
+static bool matchCommaNumber(std::string const& in, size_t i, uint64_t& value, size_t& end) {
+    size_t const n = in.size();
+    size_t p = i;
+    size_t firstLen = 0;
+    while (p < n && std::isdigit(static_cast<unsigned char>(in[p]))) { ++p; ++firstLen; }
+    if (firstLen == 0 || firstLen > 3) return false;
+    if (p >= n || in[p] != ',') return false;
+    std::string digits = in.substr(i, firstLen);
+    size_t q = p;
+    while (q + 3 < n && in[q] == ',' &&
+           std::isdigit(static_cast<unsigned char>(in[q + 1])) &&
+           std::isdigit(static_cast<unsigned char>(in[q + 2])) &&
+           std::isdigit(static_cast<unsigned char>(in[q + 3]))) {
+        digits += in.substr(q + 1, 3);
+        q += 4;
+    }
+    if (q == p) return false; // no full ,ddd group followed
+    if (q < n && (std::isdigit(static_cast<unsigned char>(in[q])) || std::isalpha(static_cast<unsigned char>(in[q]))))
+        return false;
+    if (i > 0 && std::isalnum(static_cast<unsigned char>(in[i - 1]))) return false;
+    if (digits.size() > 15) return false;
+    value = std::stoull(digits);
+    end = q;
+    return true;
+}
+
+// Try to match an abbreviated number at position i: \d+(\.\d+)?[KMB] with
+// standalone boundaries. On success sets value/end and returns true.
+static bool matchAbbrevNumber(std::string const& in, size_t i, double& value, size_t& end) {
+    size_t const n = in.size();
+    size_t p = i;
+    while (p < n && std::isdigit(static_cast<unsigned char>(in[p]))) ++p;
+    if (p == i || p - i > 12) return false;
+    size_t fracStart = 0, fracLen = 0;
+    if (p < n && in[p] == '.') {
+        fracStart = p + 1;
+        size_t q = fracStart;
+        while (q < n && std::isdigit(static_cast<unsigned char>(in[q]))) ++q;
+        if (q == fracStart) return false;
+        fracLen = q - fracStart;
+        p = q;
+    }
+    if (p >= n) return false;
+    char suf = in[p];
+    if (suf != 'K' && suf != 'M' && suf != 'B') return false;
+    if (p + 1 < n && std::isalnum(static_cast<unsigned char>(in[p + 1]))) return false;
+    if (i > 0 && std::isalnum(static_cast<unsigned char>(in[i - 1]))) return false;
+    double v = std::stod(in.substr(i, p - i));
+    v *= (suf == 'K') ? 1e3 : (suf == 'M') ? 1e6 : 1e9;
+    value = v;
+    end = p + 1;
+    return true;
+}
+
 static std::string convertText(std::string const& in) {
     std::string out;
     out.reserve(in.size() + 8);
@@ -143,6 +250,18 @@ static std::string convertText(std::string const& in) {
     while (i < n) {
         unsigned char c = static_cast<unsigned char>(in[i]);
         if (std::isdigit(c)) {
+            uint64_t commaVal; size_t commaEnd;
+            double abbrevVal; size_t abbrevEnd;
+            if (matchCommaNumber(in, i, commaVal, commaEnd)) {
+                out += toSenaryGrouped(commaVal);
+                i = commaEnd;
+                continue;
+            }
+            if (matchAbbrevNumber(in, i, abbrevVal, abbrevEnd)) {
+                out += senaryAbbrev(abbrevVal);
+                i = abbrevEnd;
+                continue;
+            }
             size_t start = i;
             while (i < n && std::isdigit(static_cast<unsigned char>(in[i]))) ++i;
             size_t len = i - start;
@@ -151,7 +270,6 @@ static std::string convertText(std::string const& in) {
             if (leftOk && rightOk && len <= 15) {
                 uint64_t v = std::stoull(in.substr(start, len));
                 if (s_rescalePercentTokens && i < n && in[i] == '%' && v <= 100) {
-                    // Semantic rescale inside New Best scope: percent -> pernif.
                     out += toSenary(static_cast<uint64_t>(
                         pernifFromSavedPercent(static_cast<int>(v))));
                 } else {
@@ -169,9 +287,6 @@ static std::string convertText(std::string const& in) {
     return out;
 }
 
-// Horizontal flip for every % glyph; explicit un-flip elsewhere since glyph
-// sprites are reused across setString calls. cocos2d tags each glyph sprite
-// with its character index.
 static void flipPernifGlyphs(CCLabelBMFont* label, std::string const& text) {
     for (size_t i = 0; i < text.size(); ++i) {
         auto* glyph = typeinfo_cast<CCSprite*>(label->getChildByTag(static_cast<int>(i)));
@@ -179,7 +294,16 @@ static void flipPernifGlyphs(CCLabelBMFont* label, std::string const& text) {
     }
 }
 
-// Shared core for the setString-family hooks; returns the string to pass on.
+// Labels inside a text input display what the user typed, untouched.
+static bool insideTextInput(CCLabelBMFont* label) {
+    CCNode* node = label;
+    for (int depth = 0; node && depth < 5; ++depth) {
+        if (typeinfo_cast<CCTextInputNode*>(node)) return true;
+        node = node->getParent();
+    }
+    return false;
+}
+
 static std::string process(CCLabelBMFont* label, char const* raw) {
     std::string in = raw ? raw : "";
     if (!enabled()) return in;
@@ -187,6 +311,7 @@ static std::string process(CCLabelBMFont* label, char const* raw) {
         s_lastOutput[label] = in;
         return in;
     }
+    if (insideTextInput(label)) return in;
     auto it = s_lastOutput.find(label);
     if (it != s_lastOutput.end() && it->second == in) return in;
     std::string out = convertText(in);
@@ -195,7 +320,6 @@ static std::string process(CCLabelBMFont* label, char const* raw) {
     return out;
 }
 
-// Write a pre-formatted senary string, bypassing conversion.
 static void setSenaryString(CCLabelBMFont* label, std::string const& s) {
     s_bypass = true;
     label->setString(s.c_str());
@@ -203,10 +327,32 @@ static void setSenaryString(CCLabelBMFont* label, std::string const& s) {
     flipPernifGlyphs(label, s);
 }
 
-// Rewrite a label of the form "<prefix><digits[.digits]>%" keeping the
-// prefix, replacing the numeric tail with a given pernif string. Used where
-// the numeric part may already be digit-converted, so it is discarded rather
-// than parsed.
+// Keep the non-numeric prefix, replace everything from the first digit on.
+static void rewriteFromFirstDigit(CCLabelBMFont* label, std::string const& replacement) {
+    std::string cur = label->getString() ? label->getString() : "";
+    size_t first = cur.find_first_of("0123456789");
+    if (first == std::string::npos) first = cur.size();
+    setSenaryString(label, cur.substr(0, first) + replacement);
+}
+
+// Did vanilla abbreviate this label? (any K/M/B directly after a digit)
+static bool labelLooksAbbreviated(CCLabelBMFont* label) {
+    std::string cur = label->getString() ? label->getString() : "";
+    for (size_t i = 1; i < cur.size(); ++i) {
+        if ((cur[i] == 'K' || cur[i] == 'M' || cur[i] == 'B') &&
+            std::isdigit(static_cast<unsigned char>(cur[i - 1]))) return true;
+    }
+    return false;
+}
+
+// Vanilla full stays full at any size; vanilla abbreviated re-abbreviates
+// (falling back to full below unexian).
+static std::string formatCount(CCLabelBMFont* label, int count) {
+    uint64_t v = static_cast<uint64_t>(std::max(0, count));
+    return labelLooksAbbreviated(label) ? senaryAbbrev(static_cast<double>(v))
+                                        : toSenaryGrouped(v);
+}
+
 static void rewritePercentTail(CCLabelBMFont* label, std::string const& pernif) {
     std::string cur = label->getString() ? label->getString() : "";
     size_t pct = cur.rfind('%');
@@ -216,20 +362,28 @@ static void rewritePercentTail(CCLabelBMFont* label, std::string const& pernif) 
         unsigned char prev = static_cast<unsigned char>(cur[start - 1]);
         if (std::isdigit(prev) || prev == '.') --start; else break;
     }
-    if (start == pct) return; // no numeric tail found
+    if (start == pct) return;
     setSenaryString(label, cur.substr(0, start) + pernif);
+}
+
+// Typed digits are senary. Reinterpret an int the game parsed as decimal:
+// its decimal digit string, read base 6. Digits 6-9 mean the input wasn't
+// valid senary; pass it through unchanged.
+static int reinterpretTypedAsSenary(int value) {
+    if (value < 0) return value;
+    std::string d = std::to_string(value);
+    int out = 0;
+    for (char ch : d) {
+        if (ch > '5') return value;
+        out = out * 6 + (ch - '0');
+    }
+    return out;
 }
 
 } // namespace senary
 
 // --- global backbone ------------------------------------------------------
 
-// One override per function name only: Geode's $modify resolves the hook
-// target through &Derived::name, which is ambiguous with two overloads.
-// The two-arg setString is the funnel; the one-arg overload and setCString
-// call into it, and Geode hooks the function address, so those calls are
-// intercepted too. initWithString covers creation-time text in case it does
-// not route through setString.
 class $modify(SenaryLabel, CCLabelBMFont) {
     void setString(char const* str, bool needUpdateLabel) {
         std::string out = senary::process(this, str);
@@ -243,6 +397,16 @@ class $modify(SenaryLabel, CCLabelBMFont) {
             return false;
         if (senary::enabled()) senary::flipPernifGlyphs(this, out);
         return true;
+    }
+};
+
+class $modify(SenaryCounterLabel, CCCounterLabel) {
+    void updateString() {
+        CCCounterLabel::updateString();
+        if (!senary::enabled()) return;
+        int v = m_currentCount;
+        if (v < 0) return;
+        senary::setSenaryString(this, senary::toSenaryGrouped(static_cast<uint64_t>(v)));
     }
 };
 
@@ -261,8 +425,6 @@ class $modify(SenaryPlayLayer, PlayLayer) {
         senary::setSenaryString(m_percentageLabel, senary::formatPernif(percent, radix));
     }
 
-    // Keep the stored bests on the legal floored set, and remember the
-    // whole-pernif best for New Best gating.
     void normalizeStoredBests() {
         if (!m_level) return;
         int normal = senary::normalizeSavedPercent(m_level->m_normalPercent.value());
@@ -297,33 +459,44 @@ class $modify(SenaryPlayLayer, PlayLayer) {
         int wholeNow = static_cast<int>(std::floor(
             static_cast<double>(this->getCurrentPercent()) * 36.0 / 100.0 + 1e-9));
         if (wholeNow <= m_fields->bestWholePernif) {
-            // Intra-pernif gain: no popup, and undo vanilla's raw save.
             normalizeStoredBests();
             return;
         }
         m_fields->bestWholePernif = wholeNow;
-        normalizeStoredBests(); // floors the freshly written raw percent
+        normalizeStoredBests();
         senary::s_rescalePercentTokens = true;
         PlayLayer::showNewBest(newReward, orbs, diamonds, demonKey, noRetry, noTitle);
         senary::s_rescalePercentTokens = false;
     }
 };
 
+// Level page: pernifage bars, exact download/like counts, hidden orb count.
 class $modify(SenaryLevelInfoLayer, LevelInfoLayer) {
     void setupProgressBars() {
         LevelInfoLayer::setupProgressBars();
         if (!senary::enabled() || !m_level) return;
-        struct Target { char const* id; int percent; };
-        Target targets[] = {
-            { "normal-mode-percentage",   m_level->m_normalPercent.value() },
-            { "practice-mode-percentage", m_level->m_practicePercent },
-        };
-        for (auto const& t : targets) {
-            auto* label = typeinfo_cast<CCLabelBMFont*>(this->getChildByIDRecursive(t.id));
-            if (!label) continue;
-            int pernif = senary::pernifFromSavedPercent(t.percent);
-            senary::setSenaryString(label, senary::toSenary(pernif) + "%");
-        }
+        Ref<LevelInfoLayer> self(this);
+        Loader::get()->queueInMainThread([self] {
+            if (!self->m_level) return;
+            struct Target { char const* id; int percent; };
+            Target targets[] = {
+                { "normal-mode-percentage",   self->m_level->m_normalPercent.value() },
+                { "practice-mode-percentage", self->m_level->m_practicePercent },
+            };
+            for (auto const& t : targets) {
+                auto* label = typeinfo_cast<CCLabelBMFont*>(self->getChildByIDRecursive(t.id));
+                if (!label) continue;
+                int pernif = senary::pernifFromSavedPercent(t.percent);
+                senary::setSenaryString(label, senary::toSenary(pernif) + "%");
+            }
+            if (self->m_downloadsLabel)
+                senary::setSenaryString(self->m_downloadsLabel,
+                    senary::formatCount(self->m_downloadsLabel, self->m_level->m_downloads));
+            if (self->m_likesLabel)
+                senary::setSenaryString(self->m_likesLabel,
+                    senary::formatCount(self->m_likesLabel, self->m_level->m_likes));
+            if (self->m_orbsLabel) self->m_orbsLabel->setVisible(false);
+        });
     }
 };
 
@@ -331,18 +504,71 @@ class $modify(SenaryPauseLayer, PauseLayer) {
     void setupProgressBars() {
         PauseLayer::setupProgressBars();
         if (!senary::enabled()) return;
-        auto* play = PlayLayer::get();
-        if (!play || !play->m_level) return;
-        struct Target { char const* id; int percent; };
-        Target targets[] = {
-            { "normal-progress-label",   play->m_level->m_normalPercent.value() },
-            { "practice-progress-label", play->m_level->m_practicePercent },
-        };
-        for (auto const& t : targets) {
-            auto* label = typeinfo_cast<CCLabelBMFont*>(this->getChildByIDRecursive(t.id));
-            if (!label) continue;
-            int pernif = senary::pernifFromSavedPercent(t.percent);
-            senary::rewritePercentTail(label, senary::toSenary(pernif) + "%");
-        }
+        Ref<PauseLayer> self(this);
+        Loader::get()->queueInMainThread([self] {
+            auto* play = PlayLayer::get();
+            if (!play || !play->m_level) return;
+            struct Target { char const* id; int percent; };
+            Target targets[] = {
+                { "normal-progress-label",   play->m_level->m_normalPercent.value() },
+                { "practice-progress-label", play->m_level->m_practicePercent },
+            };
+            for (auto const& t : targets) {
+                auto* label = typeinfo_cast<CCLabelBMFont*>(self->getChildByIDRecursive(t.id));
+                if (!label) continue;
+                int pernif = senary::pernifFromSavedPercent(t.percent);
+                senary::rewritePercentTail(label, senary::toSenary(pernif) + "%");
+            }
+        });
+    }
+};
+
+// Endscreen: T6 time from the precise level-time double.
+class $modify(SenaryEndLevelLayer, EndLevelLayer) {
+    void customSetup() {
+        EndLevelLayer::customSetup();
+        if (!senary::enabled()) return;
+        Ref<EndLevelLayer> self(this);
+        Loader::get()->queueInMainThread([self] {
+            auto* play = PlayLayer::get();
+            if (!play) return;
+            auto* label = typeinfo_cast<CCLabelBMFont*>(self->getChildByIDRecursive("time-label"));
+            if (!label) return;
+            senary::rewriteFromFirstDigit(label,
+                senary::formatT6Time(play->m_gameState.m_levelTime));
+        });
+    }
+};
+
+// Browser cells: exact counts, hidden orb count.
+class $modify(SenaryLevelCell, LevelCell) {
+    void loadCustomLevelCell() {
+        LevelCell::loadCustomLevelCell();
+        if (!senary::enabled() || !m_level) return;
+        Ref<LevelCell> self(this);
+        Loader::get()->queueInMainThread([self] {
+            if (!self->m_level) return;
+            struct Target { char const* id; int count; };
+            Target targets[] = {
+                { "downloads-label", self->m_level->m_downloads },
+                { "likes-label",     self->m_level->m_likes },
+            };
+            for (auto const& t : targets) {
+                auto* label = typeinfo_cast<CCLabelBMFont*>(self->getChildByIDRecursive(t.id));
+                if (!label) continue;
+                senary::setSenaryString(label, senary::formatCount(label, t.count));
+            }
+            if (auto* orbs = typeinfo_cast<CCLabelBMFont*>(self->getChildByIDRecursive("orbs-label")))
+                orbs->setVisible(false);
+        });
+    }
+};
+
+// Number-entry popups reaching LevelBrowserLayer (page jump, folders):
+// typed digits are senary; the game gets the decimal value.
+class $modify(SenaryLevelBrowserLayer, LevelBrowserLayer) {
+    void setIDPopupClosed(SetIDPopup* popup, int value) {
+        if (senary::enabled()) value = senary::reinterpretTypedAsSenary(value);
+        LevelBrowserLayer::setIDPopupClosed(popup, value);
     }
 };
