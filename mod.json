@@ -1,0 +1,29 @@
+{
+	"geode": "5.2.0",
+	"gd": {
+		"win": "2.2081"
+	},
+	"id": "smallclover.senary_numbers",
+	"name": "Senary Numbers",
+	"version": "v0.1.0",
+	"developer": "small.clover",
+	"description": "Converts numerical displays in GD to senary, with pernifage progress.",
+	"dependencies": {
+		"geode.node-ids": ">=v1.23.0"
+	},
+	"settings": {
+		"enabled": {
+			"type": "bool",
+			"name": "Enabled",
+			"default": true,
+			"description": "Enable senary conversion."
+		},
+		"debug-logging": {
+			"type": "bool",
+			"name": "Debug logging",
+			"default": false,
+			"description": "Log every string conversion to the Geode console, for finding over/under-conversion."
+		}
+	},
+	"tags": ["offline", "customization", "interface", "gameplay"]
+}
