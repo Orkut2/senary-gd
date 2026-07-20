@@ -678,6 +678,26 @@ static void setSenaryString(CCLabelBMFont* label, std::string const& s) {
     flipPernifGlyphs(label, s);
 }
 
+// One-shot conversion sweep over a subtree, for text set through paths the
+// global hooks miss (e.g. setCString has no Windows address). Skips inputs,
+// user content, and labels this mod already wrote.
+static void sweepConvertLabels(CCNode* root) {
+    if (!root) return;
+    if (auto* l = typeinfo_cast<CCLabelBMFont*>(root)) {
+        std::string cur = l->getString() ? l->getString() : "";
+        auto it = s_lastOutput.find(l);
+        bool ours = it != s_lastOutput.end() && it->second == cur;
+        if (!cur.empty() && !ours && !insideTextInput(l) && !isUserContent(l)) {
+            std::string conv = convertText(cur);
+            if (conv != cur) setSenaryString(l, conv);
+        }
+    }
+    auto* children = root->getChildren();
+    if (!children) return;
+    for (int i = 0; i < static_cast<int>(root->getChildrenCount()); ++i)
+        sweepConvertLabels(static_cast<CCNode*>(children->objectAtIndex(i)));
+}
+
 static void rewritePercentTail(CCLabelBMFont* label, std::string const& pernif) {
     std::string cur = label->getString() ? label->getString() : "";
     size_t pct = cur.rfind('%');
@@ -1029,10 +1049,10 @@ class $modify(SenaryLevelCell, LevelCell) {
 
             if (downloads)
                 senary::setSenaryString(downloads,
-                    senary::formatCount(downloads, self->m_level->m_downloads));
+                    senary::formatCellCount(self->m_level->m_downloads));
             if (likes)
                 senary::setSenaryString(likes,
-                    senary::formatCount(likes, self->m_level->m_likes));
+                    senary::formatCellCount(self->m_level->m_likes));
 
             senary::repackRow(snap);
 
@@ -1287,7 +1307,7 @@ class $modify(SenarySetupTriggerPopup, SetupTriggerPopup) {
 class $modify(SenaryLeaderboardsLayer, LeaderboardsLayer) {
     void setupLevelBrowser(cocos2d::CCArray* scores) {
         if (senary::enabled() &&
-            (m_type == LeaderboardType::Top100 || m_type == LeaderboardType::Creators) &&
+            (m_type == LeaderboardType::Top100 || m_type == LeaderboardType::Creator) &&
             scores && scores->count() > 36) {
             auto* trimmed = cocos2d::CCArray::create();
             for (unsigned int i = 0; i < 36; ++i)
