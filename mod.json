@@ -5,7 +5,7 @@
  },
  "id": "smallclover.senary_numbers",
  "name": "Senary Numbers",
- "version": "v0.4.2",
+ "version": "v0.5.0",
  "developer": "small.clover",
  "description": "Converts numerical displays in GD to senary, with pernifage progress.",
  "dependencies": {
