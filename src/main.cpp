@@ -1,4 +1,22 @@
-// Senary Numbers — v0.4.2
+// Senary Numbers — v0.5.0 (first internal revision toward the fifth
+// compile, v0.5; v0.5 rolls over to v1.0)
+//
+// Changes from v0.4 (fifth-compile prep):
+// - Countdowns (daily/weekly/event/quests) use vanilla's two-unit format in
+//   T6 ("1days 22h", "3h 41min"), sourced cleanly (no flicker, prefix kept).
+// - Saved-tab cells and daily/weekly cards abbreviate counts of six or more
+//   senary digits (>= 10,0000) as U/B; level page stays full.
+// - List-vs-page pernifage agreement: both now use the legal-save-aware
+//   ceil/floor rule (legacy odd saves floor consistently).
+// - Saves no longer touched on level load: snapping to legal pernif-percents
+//   happens ONLY inside a triggered New Best; suppressed intra-pernif bests
+//   restore the pre-attempt stored value.
+// - Top leaderboard clamps to one nif (36x) and Creators is clamped too.
+// - "Pernifage Decimals" setting renamed to "Pernif Radix Digits".
+// - WIP level ID on the edit screen restored to decimal.
+// - Comment dates append " ago" again.
+// - Quest diamond rewards (and other stragglers) converted via a one-shot
+//   label sweep; main-level orb icon+count hidden on LevelPage.
 //
 // Changes from v0.4.1:
 // - Time fractions now carry FOUR senary radix digits (untisecond
@@ -70,16 +88,25 @@
 #include <Geode/modify/SetupTriggerPopup.hpp>
 #include <Geode/modify/CommentCell.hpp>
 #include <Geode/modify/DailyLevelPage.hpp>
+#include <Geode/modify/DailyLevelNode.hpp>
+#include <Geode/modify/ChallengesPage.hpp>
+#include <Geode/modify/LevelPage.hpp>
+#include <Geode/modify/EditLevelLayer.hpp>
 #include <Geode/binding/CommentCell.hpp>
 #include <Geode/binding/TextArea.hpp>
 #include <Geode/binding/GJComment.hpp>
 #include <Geode/modify/CommentCell.hpp>
 #include <Geode/modify/DailyLevelPage.hpp>
+#include <Geode/modify/DailyLevelNode.hpp>
+#include <Geode/modify/ChallengesPage.hpp>
+#include <Geode/modify/LevelPage.hpp>
+#include <Geode/modify/EditLevelLayer.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -231,6 +258,62 @@ static std::string formatT6Time(double siSeconds, bool withFraction = false) {
     return out;
 }
 
+// Vanilla-style two-unit countdown in T6: highest nonzero unit plus the
+// next one down when nonzero ("1days 22h", "3h 41min", "2min 05s", "14s").
+static std::string formatT6Units(double siSeconds) {
+    if (siSeconds < 0) siSeconds = 0;
+    uint64_t total = static_cast<uint64_t>(std::floor(siSeconds * 27.0 / 50.0 + 1e-9));
+    uint64_t d = total / 46656;
+    uint64_t h = (total / 1296) % 36;
+    uint64_t m = (total / 36) % 36;
+    uint64_t sec = total % 36;
+    struct U { uint64_t v; char const* one; char const* many; };
+    U units[] = { { d, "day", "days" }, { h, "h", "h" },
+                  { m, "min", "min" }, { sec, "s", "s" } };
+    int first = -1;
+    for (int i = 0; i < 4; ++i) if (units[i].v > 0) { first = i; break; }
+    if (first < 0) return "0s";
+    std::string out = toSenary(units[first].v) +
+                      (units[first].v == 1 ? units[first].one : units[first].many);
+    for (int i = first + 1; i < 4; ++i) {
+        if (units[i].v > 0) {
+            out += " " + toSenary(units[i].v) +
+                   (units[i].v == 1 ? units[i].one : units[i].many);
+            break;
+        }
+    }
+    return out;
+}
+
+// Parse a vanilla two-unit countdown string ("6days 18h", "18h 17min",
+// "2min 43s", "51s") into SI seconds. Returns false on no unit tokens.
+static bool parseUnitTime(std::string const& text, double& siSeconds) {
+    double total = 0;
+    bool any = false;
+    size_t i = 0, n = text.size();
+    while (i < n) {
+        if (std::isdigit(static_cast<unsigned char>(text[i]))) {
+            size_t start = i;
+            while (i < n && std::isdigit(static_cast<unsigned char>(text[i]))) ++i;
+            long v = std::stol(text.substr(start, i - start));
+            while (i < n && text[i] == ' ') ++i;
+            size_t u = i;
+            while (u < n && std::isalpha(static_cast<unsigned char>(text[u]))) ++u;
+            std::string unit = text.substr(i, u - i);
+            double mult = 0;
+            if (unit == "day" || unit == "days" || unit == "d") mult = 86400;
+            else if (unit == "h" || unit == "hour" || unit == "hours") mult = 3600;
+            else if (unit == "min" || unit == "m") mult = 60;
+            else if (unit == "s" || unit == "sec") mult = 1;
+            if (mult > 0) { total += v * mult; any = true; i = u; }
+        } else {
+            ++i;
+        }
+    }
+    siSeconds = total;
+    return any;
+}
+
 // Senary float from typed text ("1.3" = 1.5x, "-20" = -12x). False if the
 // text contains digits 6-9 or isn't a plain number.
 static bool parseSenaryFloat(std::string const& s, double& out) {
@@ -272,6 +355,17 @@ static std::string formatDecimalForGame(double v) {
 }
 
 // --- text conversion ------------------------------------------------------
+
+static void replacePhrases(std::string& s) {
+    static constexpr std::pair<char const*, char const*> PHRASES[] = {
+        { "Percentage Decimals", "Pernif Radix Digits" },
+        { "percentage decimals", "pernif radix digits" },
+    };
+    for (auto const& [from, to] : PHRASES) {
+        size_t pos = s.find(from);
+        if (pos != std::string::npos) s.replace(pos, std::string(from).size(), to);
+    }
+}
 
 static void replacePercentWords(std::string& s) {
     static constexpr const char* FROM[] = { "percent", "Percent", "PERCENT" };
@@ -524,6 +618,7 @@ static std::string convertText(std::string const& in) {
             ++i;
         }
     }
+    replacePhrases(out);
     replacePercentWords(out);
     return out;
 }
@@ -603,20 +698,12 @@ static void rewriteFromFirstDigit(CCLabelBMFont* label, std::string const& repla
     setSenaryString(label, cur.substr(0, first) + replacement);
 }
 
-// Vanilla full stays full; vanilla abbreviated re-abbreviates.
-static bool labelLooksAbbreviated(CCLabelBMFont* label) {
-    std::string cur = label->getString() ? label->getString() : "";
-    for (size_t i = 1; i < cur.size(); ++i) {
-        if ((cur[i] == 'K' || cur[i] == 'M' || cur[i] == 'B') &&
-            std::isdigit(static_cast<unsigned char>(cur[i - 1]))) return true;
-    }
-    return false;
-}
-
-static std::string formatCount(CCLabelBMFont* label, int count) {
+// Cells and cards: five or more senary digits (anything above 5555, i.e.
+// >= unexian) abbreviates as U/B; below that, full. The level page keeps
+// full form at any size.
+static std::string formatCellCount(int count) {
     uint64_t v = static_cast<uint64_t>(std::max(0, count));
-    return labelLooksAbbreviated(label) ? senaryAbbrev(static_cast<double>(v))
-                                        : toSenaryGrouped(v);
+    return v >= UNEXIAN ? senaryAbbrev(static_cast<double>(v)) : toSenaryGrouped(v);
 }
 
 static int reinterpretTypedAsSenary(int value) {
@@ -726,6 +813,8 @@ class $modify(SenaryCounterLabel, CCCounterLabel) {
 class $modify(SenaryPlayLayer, PlayLayer) {
     struct Fields {
         int bestWholePernif = -1;
+        int attemptStoredNormal = 0;
+        int attemptStoredPractice = 0;
     };
 
     void updatePernifLabel() {
@@ -745,29 +834,36 @@ class $modify(SenaryPlayLayer, PlayLayer) {
         }
     }
 
-    void normalizeStoredBests() {
+    // Read-only: track the whole-pernif best and the exact stored values at
+    // attempt start. Saves are never rewritten here — legacy odd percents
+    // stay untouched until a genuine New Best replaces them.
+    void syncBestTracker() {
         if (!m_level) return;
-        int normal = senary::normalizeSavedPercent(m_level->m_normalPercent.value());
-        if (normal != m_level->m_normalPercent.value()) m_level->m_normalPercent = normal;
-        int practice = senary::normalizeSavedPercent(m_level->m_practicePercent);
-        if (practice != m_level->m_practicePercent) m_level->m_practicePercent = practice;
-        int stored = m_isPracticeMode ? practice : normal;
-        int whole = senary::pernifFromSavedPercent(stored);
+        m_fields->attemptStoredNormal = m_level->m_normalPercent.value();
+        m_fields->attemptStoredPractice = m_level->m_practicePercent;
+        int stored = m_isPracticeMode ? m_fields->attemptStoredPractice
+                                      : m_fields->attemptStoredNormal;
+        int whole = senary::displayPernifForPercent(stored);
         if (whole > m_fields->bestWholePernif) m_fields->bestWholePernif = whole;
+    }
+
+    void writeActiveBest(int percent) {
+        if (!m_level) return;
+        if (m_isPracticeMode) m_level->m_practicePercent = percent;
+        else m_level->m_normalPercent = percent;
     }
 
     void updateProgressbar() {
         PlayLayer::updateProgressbar();
         if (!senary::enabled()) return;
         updatePernifLabel();
-        normalizeStoredBests();
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
         if (!senary::enabled()) return;
         updatePernifLabel();
-        normalizeStoredBests();
+        syncBestTracker();
     }
 
     void showNewBest(bool newReward, int orbs, int diamonds,
@@ -779,11 +875,16 @@ class $modify(SenaryPlayLayer, PlayLayer) {
         int wholeNow = static_cast<int>(std::floor(
             static_cast<double>(this->getCurrentPercent()) * 36.0 / 100.0 + 1e-9));
         if (wholeNow <= m_fields->bestWholePernif) {
-            normalizeStoredBests();
+            // Intra-pernif: no popup, and undo vanilla's raw write by
+            // restoring exactly what was stored at attempt start.
+            writeActiveBest(m_isPracticeMode ? m_fields->attemptStoredPractice
+                                             : m_fields->attemptStoredNormal);
             return;
         }
         m_fields->bestWholePernif = wholeNow;
-        normalizeStoredBests();
+        // Snap the freshly written raw percent to the legal floored value —
+        // the only place saves are ever rewritten.
+        writeActiveBest(senary::savedPercentForPernif(wholeNow));
         // The popup's percent tokens are rescaled by the global pernif rule.
         PlayLayer::showNewBest(newReward, orbs, diamonds, demonKey, noRetry, noTitle);
     }
@@ -806,7 +907,7 @@ class $modify(SenaryLevelInfoLayer, LevelInfoLayer) {
             for (auto const& t : targets) {
                 auto* label = typeinfo_cast<CCLabelBMFont*>(self->getChildByIDRecursive(t.id));
                 if (!label) continue;
-                int pernif = senary::pernifFromSavedPercent(t.percent);
+                int pernif = senary::displayPernifForPercent(t.percent);
                 senary::setSenaryString(label, senary::toSenary(pernif) + "%");
             }
 
@@ -829,10 +930,12 @@ class $modify(SenaryLevelInfoLayer, LevelInfoLayer) {
 
             if (self->m_downloadsLabel)
                 senary::setSenaryString(self->m_downloadsLabel,
-                    senary::formatCount(self->m_downloadsLabel, self->m_level->m_downloads));
+                    senary::toSenaryGrouped(static_cast<uint64_t>(
+                        std::max(0, self->m_level->m_downloads))));
             if (self->m_likesLabel)
                 senary::setSenaryString(self->m_likesLabel,
-                    senary::formatCount(self->m_likesLabel, self->m_level->m_likes));
+                    senary::toSenaryGrouped(static_cast<uint64_t>(
+                        std::max(0, self->m_level->m_likes))));
 
             senary::repackRow(snap);
 
@@ -865,7 +968,7 @@ class $modify(SenaryPauseLayer, PauseLayer) {
             for (auto const& t : targets) {
                 auto* label = typeinfo_cast<CCLabelBMFont*>(self->getChildByIDRecursive(t.id));
                 if (!label) continue;
-                int pernif = senary::pernifFromSavedPercent(t.percent);
+                int pernif = senary::displayPernifForPercent(t.percent);
                 senary::rewritePercentTail(label, senary::toSenary(pernif) + "%");
             }
         });
@@ -971,7 +1074,7 @@ class $modify(SenaryCommentCell, CommentCell) {
             }
             if (auto* dateLabel = find("date-label")) {
                 if (!date.empty())
-                    senary::setSenaryString(dateLabel, senary::convertText(date));
+                    senary::setSenaryString(dateLabel, senary::convertText(date) + " ago");
             }
         });
     }
@@ -995,14 +1098,20 @@ class $modify(SenaryDailyLevelPage, DailyLevelPage) {
         return true;
     }
 
+    // Replaced at the source: vanilla inserts this into its own
+    // "New Daily Level in: %s" template, so the prefix survives and there
+    // is nothing to flicker against. Unit-format output ("1days 22h") has
+    // no standalone digit runs, so the global hook leaves it alone.
     gd::string getDailyTimeString(int timeLeft) {
-        if (senary::enabled()) {
-            m_fields->lastReportedSeconds = timeLeft;
-            m_fields->sinceReport = 0.0;
-        }
-        return DailyLevelPage::getDailyTimeString(timeLeft);
+        if (!senary::enabled())
+            return DailyLevelPage::getDailyTimeString(timeLeft);
+        m_fields->lastReportedSeconds = timeLeft;
+        m_fields->sinceReport = 0.0;
+        return senary::formatT6Units(static_cast<double>(timeLeft));
     }
 
+    // Sub-SI-second refinement only while seconds are visible (< 1 T6 min
+    // remaining), so T6-second boundaries land on time in the final stretch.
     void updateTimers(float dt) {
         DailyLevelPage::updateTimers(dt);
         if (!senary::enabled()) return;
@@ -1010,10 +1119,120 @@ class $modify(SenaryDailyLevelPage, DailyLevelPage) {
         m_fields->sinceReport += dt;
         double remaining = static_cast<double>(m_fields->lastReportedSeconds) - m_fields->sinceReport;
         if (remaining < 0) remaining = 0;
-        std::string t6 = senary::formatT6Time(remaining, false);
+        if (remaining * 27.0 / 50.0 >= 36.0) return; // minutes+ handled at source
+        std::string t6 = senary::formatT6Units(remaining);
         if (t6 == m_fields->lastShown) return;
         m_fields->lastShown = t6;
-        senary::setSenaryString(m_timeLabel, t6);
+        senary::rewriteFromFirstDigit(m_timeLabel, t6);
+    }
+};
+
+// Quests: countdown label reformatted to T6 units by parsing vanilla's
+// decimal unit text each timer tick; diamond rewards and any other labels
+// that bypassed the string hooks get a one-shot sweep.
+class $modify(SenaryChallengesPage, ChallengesPage) {
+    struct Fields {
+        std::string lastShown;
+    };
+
+    void updateTimers(float dt) {
+        ChallengesPage::updateTimers(dt);
+        if (!senary::enabled() || !m_countdownLabel) return;
+        std::string cur = m_countdownLabel->getString() ? m_countdownLabel->getString() : "";
+        if (cur.empty() || cur == m_fields->lastShown) return;
+        double si;
+        if (!senary::parseUnitTime(cur, si)) return;
+        std::string t6 = senary::formatT6Units(si);
+        m_fields->lastShown = t6;
+        senary::rewriteFromFirstDigit(m_countdownLabel, t6);
+        // grab the string as vanilla template kept: lastShown must match the
+        // full label to short-circuit; store the rewritten full text instead
+        m_fields->lastShown = m_countdownLabel->getString() ? m_countdownLabel->getString() : t6;
+    }
+
+    void show() {
+        ChallengesPage::show();
+        if (!senary::enabled()) return;
+        Ref<ChallengesPage> self(this);
+        Loader::get()->queueInMainThread([self] {
+            senary::sweepConvertLabels(self);
+        });
+    }
+
+    ChallengeNode* createChallengeNode(int number, bool skipAnimation, float animLength, bool isNew) {
+        auto* node = ChallengesPage::createChallengeNode(number, skipAnimation, animLength, isNew);
+        if (senary::enabled() && node) {
+            Ref<CCNode> ref(node);
+            Loader::get()->queueInMainThread([ref] {
+                senary::sweepConvertLabels(ref);
+            });
+        }
+        return node;
+    }
+};
+
+// Main levels: hide orb icon + count (LevelPage carries them per page).
+class $modify(SenaryLevelPage, LevelPage) {
+    void updateDynamicPage(GJGameLevel* level) {
+        LevelPage::updateDynamicPage(level);
+        if (!senary::enabled()) return;
+        Ref<LevelPage> self(this);
+        Loader::get()->queueInMainThread([self] {
+            if (auto* l = self->getChildByIDRecursive("orbs-label")) l->setVisible(false);
+            if (auto* i = self->getChildByIDRecursive("orbs-icon"))  i->setVisible(false);
+        });
+    }
+};
+
+// Daily/weekly cards: counts came through the comma fallback as full form;
+// re-render from the exact ints with the cell abbreviation rule. The labels
+// carry no node IDs, so they are located by their current (full-form) text.
+class $modify(SenaryDailyLevelNode, DailyLevelNode) {
+    bool init(GJGameLevel* level, DailyLevelPage* page, bool isNew) {
+        if (!DailyLevelNode::init(level, page, isNew)) return false;
+        if (!senary::enabled() || !level) return true;
+        int downloads = std::max(0, level->m_downloads);
+        int likes = std::max(0, level->m_likes);
+        Ref<DailyLevelNode> self(this);
+        Loader::get()->queueInMainThread([self, downloads, likes] {
+            struct Pair { std::string expect; std::string replacement; };
+            Pair pairs[] = {
+                { senary::toSenaryGrouped(static_cast<uint64_t>(downloads)),
+                  senary::formatCellCount(downloads) },
+                { senary::toSenaryGrouped(static_cast<uint64_t>(likes)),
+                  senary::formatCellCount(likes) },
+            };
+            std::function<void(CCNode*)> walk = [&](CCNode* n) {
+                if (!n) return;
+                if (auto* l = typeinfo_cast<CCLabelBMFont*>(n)) {
+                    std::string cur = l->getString() ? l->getString() : "";
+                    for (auto const& p : pairs)
+                        if (cur == p.expect && p.expect != p.replacement)
+                            senary::setSenaryString(l, p.replacement);
+                }
+                auto* ch = n->getChildren();
+                if (!ch) return;
+                for (int i = 0; i < static_cast<int>(n->getChildrenCount()); ++i)
+                    walk(static_cast<CCNode*>(ch->objectAtIndex(i)));
+            };
+            walk(self);
+        });
+        return true;
+    }
+};
+
+// WIP/created level ID on the edit screen stays decimal.
+class $modify(SenaryEditLevelLayer, EditLevelLayer) {
+    bool init(GJGameLevel* level) {
+        if (!EditLevelLayer::init(level)) return false;
+        if (!senary::enabled() || !level) return true;
+        int id = level->m_levelID.value();
+        Ref<EditLevelLayer> self(this);
+        Loader::get()->queueInMainThread([self, id] {
+            auto* label = typeinfo_cast<CCLabelBMFont*>(self->getChildByIDRecursive("level-id-label"));
+            if (label) senary::rewriteFromFirstDigit(label, std::to_string(id));
+        });
+        return true;
     }
 };
 
@@ -1067,10 +1286,11 @@ class $modify(SenarySetupTriggerPopup, SetupTriggerPopup) {
 // and the tab's "244" (converted "100") is renamed to "200".
 class $modify(SenaryLeaderboardsLayer, LeaderboardsLayer) {
     void setupLevelBrowser(cocos2d::CCArray* scores) {
-        if (senary::enabled() && m_type == LeaderboardType::Top100 &&
-            scores && scores->count() > 72) {
+        if (senary::enabled() &&
+            (m_type == LeaderboardType::Top100 || m_type == LeaderboardType::Creators) &&
+            scores && scores->count() > 36) {
             auto* trimmed = cocos2d::CCArray::create();
-            for (unsigned int i = 0; i < 72; ++i)
+            for (unsigned int i = 0; i < 36; ++i)
                 trimmed->addObject(scores->objectAtIndex(i));
             LeaderboardsLayer::setupLevelBrowser(trimmed);
             return;
