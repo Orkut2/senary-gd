@@ -16,7 +16,7 @@
 //   the number's width fluctuates leftward. Applies only when the
 //   progress bar is shown.
 //
-// Changes from v0.4:
+// Changes from v0.4 (= v0.3.3, fourth compile):
 // - Generic time tokens ("12:34:56", "1:23", "0:58.123") convert to T6
 //   everywhere: covers daily/weekly/event countdowns and platformer best
 //   times on cells and leaderboards. Fractions render as two senary radix
@@ -81,7 +81,6 @@
 #include <cmath>
 #include <cstdint>
 #include <string>
-#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -942,135 +941,6 @@ class $modify(SenaryLevelCell, LevelCell) {
                     senary::restoreLabel(senary::findLabelIn(creatorBtn), "By " + name);
             }
         });
-    }
-};
-
-// Daily/weekly/event countdown at T6 cadence. Vanilla's updateTimers
-// refreshes the label once per SI second; a T6 second is ~1.85 SI s, so
-// naive conversion freezes on each value and crosses boundaries late.
-// Here the raw SI seconds are read (conversion bypassed around the
-// original call), interpolated between vanilla updates with a steady
-// clock, and the label is re-rendered on a fast schedule so T6 boundaries
-// land on time.
-class $modify(SenaryDailyLevelPage, DailyLevelPage) {
-    struct Fields {
-        int lastSi = -1;
-        std::chrono::steady_clock::time_point lastChange{};
-        std::string prefix;
-        std::string suffix;
-        bool scheduled = false;
-    };
-
-    static double nowSeconds() {
-        using namespace std::chrono;
-        return duration<double>(steady_clock::now().time_since_epoch()).count();
-    }
-
-    // Parse "h:mm:ss" / "m:ss" out of the raw label, remembering any
-    // surrounding text.
-    bool parseRawTimer(std::string const& raw, int& siSeconds) {
-        size_t first = raw.find_first_of("0123456789");
-        if (first == std::string::npos) return false;
-        size_t last = raw.find_last_of("0123456789");
-        std::string token = raw.substr(first, last - first + 1);
-        int parts[3] = { 0, 0, 0 };
-        int count = 0;
-        size_t pos = 0;
-        while (count < 3) {
-            size_t colon = token.find(':', pos);
-            std::string piece = colon == std::string::npos
-                ? token.substr(pos) : token.substr(pos, colon - pos);
-            if (piece.empty() || piece.find_first_not_of("0123456789") != std::string::npos)
-                return false;
-            parts[count++] = std::stoi(piece);
-            if (colon == std::string::npos) break;
-            pos = colon + 1;
-        }
-        if (count < 2) return false;
-        siSeconds = count == 3
-            ? parts[0] * 3600 + parts[1] * 60 + parts[2]
-            : parts[0] * 60 + parts[1];
-        m_fields->prefix = raw.substr(0, first);
-        m_fields->suffix = raw.substr(last + 1);
-        return true;
-    }
-
-    void renderT6Timer() {
-        if (!m_timeLabel) return;
-        if (m_fields->lastSi < 0) return;
-        double elapsed = nowSeconds()
-            - std::chrono::duration<double>(m_fields->lastChange.time_since_epoch()).count();
-        double remaining = static_cast<double>(m_fields->lastSi) - elapsed;
-        if (remaining < 0) remaining = 0;
-        senary::setSenaryString(m_timeLabel,
-            m_fields->prefix + senary::formatT6Time(remaining) + m_fields->suffix);
-    }
-
-    void senaryTimerTick(float) {
-        if (!senary::enabled()) return;
-        renderT6Timer();
-    }
-
-    void updateTimers(float dt) {
-        if (!senary::enabled()) {
-            DailyLevelPage::updateTimers(dt);
-            return;
-        }
-        // Read the raw SI countdown: bypass conversion around the original.
-        senary::s_bypass = true;
-        DailyLevelPage::updateTimers(dt);
-        senary::s_bypass = false;
-        if (m_timeLabel && m_timeLabel->getString()) {
-            int si;
-            std::string raw = m_timeLabel->getString();
-            if (parseRawTimer(raw, si)) {
-                if (si != m_fields->lastSi) {
-                    m_fields->lastSi = si;
-                    m_fields->lastChange = std::chrono::steady_clock::now();
-                }
-                renderT6Timer();
-            }
-        }
-        if (!m_fields->scheduled) {
-            m_fields->scheduled = true;
-            this->schedule(schedule_selector(SenaryDailyLevelPage::senaryTimerTick), 0.1f);
-        }
-    }
-};
-
-// Comment metadata converts inside the otherwise-exempt CommentCell:
-// likes, date, and the commenter's percentage. Username and comment text
-// stay raw user content.
-class $modify(SenaryCommentCell, CommentCell) {
-    void convertMetadataLabels() {
-        Ref<CommentCell> self(this);
-        Loader::get()->queueInMainThread([self] {
-            static constexpr char const* IDS[] = {
-                "likes-label", "date-label", "percentage-label"
-            };
-            for (auto* id : IDS) {
-                auto* label = typeinfo_cast<CCLabelBMFont*>(self->getChildByIDRecursive(id));
-                if (!label || !label->getString()) continue;
-                std::string cur = label->getString();
-                std::string conv = senary::convertText(cur);
-                if (conv != cur) senary::setSenaryString(label, conv);
-            }
-        });
-    }
-
-    void loadFromComment(GJComment* comment) {
-        CommentCell::loadFromComment(comment);
-        if (senary::enabled()) convertMetadataLabels();
-    }
-
-    void updateLabelValues() {
-        CommentCell::updateLabelValues();
-        if (!senary::enabled()) return;
-        if (m_likeLabel && m_likeLabel->getString()) {
-            std::string cur = m_likeLabel->getString();
-            std::string conv = senary::convertText(cur);
-            if (conv != cur) senary::setSenaryString(m_likeLabel, conv);
-        }
     }
 };
 
