@@ -5,7 +5,7 @@
  },
  "id": "smallclover.senary_numbers",
  "name": "Senary Numbers",
- "version": "v0.5.0",
+ "version": "v1.0.0",
  "developer": "small.clover",
  "description": "Converts numerical displays in GD to senary, with pernifage progress.",
  "dependencies": {
@@ -29,6 +29,18 @@
    "name": "Editor senary input",
    "default": true,
    "description": "Interpret typed numbers in trigger popups as senary (display keeps typed digits). Turn off if ID fields misbehave."
+  },
+  "fast-suppressed-respawn": {
+   "type": "bool",
+   "name": "Fast suppressed respawn",
+   "default": true,
+   "description": "Skip the New Best fanfare delay when an intra-pernif best is suppressed. Experimental: forces the normal-death respawn timing."
+  },
+  "six-per-page": {
+   "type": "bool",
+   "name": "Six levels per page",
+   "default": true,
+   "description": "Slice browser pages to six levels each (client-side)."
   }
  },
  "tags": [
