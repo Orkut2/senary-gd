@@ -1,5 +1,4 @@
-// Senary Numbers — v0.5.0 (first internal revision toward the fifth
-// compile, v0.5; v0.5 rolls over to v1.0)
+// Senary Numbers — v1.0.0 (fifth compile: the senary rollover from v0.5)
 //
 // Changes from v0.4 (fifth-compile prep):
 // - Countdowns (daily/weekly/event/quests) use vanilla's two-unit format in
@@ -77,6 +76,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/binding/CCTextInputNode.hpp>
 #include <Geode/modify/CCLabelBMFont.hpp>
+#include <Geode/modify/FLAlertLayer.hpp>
 #include <Geode/modify/CCCounterLabel.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/LevelInfoLayer.hpp>
@@ -87,20 +87,20 @@
 #include <Geode/modify/LeaderboardsLayer.hpp>
 #include <Geode/modify/SetupTriggerPopup.hpp>
 #include <Geode/modify/CommentCell.hpp>
+#include <Geode/modify/GJLevelScoreCell.hpp>
+#include <Geode/modify/GJLocalLevelScoreCell.hpp>
 #include <Geode/modify/DailyLevelPage.hpp>
 #include <Geode/modify/DailyLevelNode.hpp>
 #include <Geode/modify/ChallengesPage.hpp>
 #include <Geode/modify/LevelPage.hpp>
 #include <Geode/modify/EditLevelLayer.hpp>
+#include <Geode/modify/LevelListLayer.hpp>
+#include <Geode/modify/SecretRewardsLayer.hpp>
 #include <Geode/binding/CommentCell.hpp>
 #include <Geode/binding/TextArea.hpp>
 #include <Geode/binding/GJComment.hpp>
-#include <Geode/modify/CommentCell.hpp>
-#include <Geode/modify/DailyLevelPage.hpp>
-#include <Geode/modify/DailyLevelNode.hpp>
-#include <Geode/modify/ChallengesPage.hpp>
-#include <Geode/modify/LevelPage.hpp>
-#include <Geode/modify/EditLevelLayer.hpp>
+#include <Geode/binding/GJAccountManager.hpp>
+#include <Geode/binding/GJUserScore.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -116,6 +116,24 @@ using namespace geode::prelude;
 namespace senary {
 
 static bool s_bypass = false;
+
+// Set while percent tokens must be read as the BOTTOM of their percent
+// interval (13% = 13.00% = 4 pernif): the New Best popup (raw current
+// percents) and leaderboard score cells (other players' scores, per the
+// bottom-of-interval ruling). Elsewhere, integer percents use the
+// legal-save-aware recovery so this mod's own floored saves round-trip.
+static bool s_floorPercentTokens = false;
+
+// Set while CommentCell::loadFromComment runs: every string set during it
+// (comment text, TextArea lines, username) passes through untouched. The
+// old ancestor-walk exemption failed because labels are parentless while
+// their text is first set. Metadata is then re-converted by the targeted
+// deferred pass.
+static bool s_userContentScope = false;
+
+// Set while an FLAlertLayer builds from a description this mod already
+// converted: inner labels pass through so the text isn't converted twice.
+static bool s_preconvertedScope = false;
 static std::unordered_map<CCLabelBMFont*, std::string> s_lastOutput;
 
 static bool enabled() {
@@ -153,8 +171,10 @@ static std::string toSenaryGrouped(uint64_t v) {
 static constexpr uint64_t UNEXIAN = 1296;      // 6^4
 static constexpr uint64_t BIEXIAN = 1679616;   // 6^8
 
-// Below unexian: full grouped senary, even where vanilla abbreviated.
-// At unexian and above: "X.dU" / "X.dB", one senary radix digit, rounded.
+// Below unexian (<= 5555): full grouped senary, even where vanilla
+// abbreviated. At unexian and above: "X.dU" / "X.dB", one rounded senary
+// radix digit — dropped when the whole part already has four digits
+// ("2412U", never "2412.0U").
 static std::string senaryAbbrev(double v) {
     if (v < 0) v = 0;
     if (v < static_cast<double>(UNEXIAN))
@@ -167,11 +187,14 @@ static std::string senaryAbbrev(double v) {
         suffix = 'B';
         sixths = static_cast<uint64_t>(std::llround(v * 6.0 / static_cast<double>(base)));
     }
-    std::string s = toSenary(sixths / 6);
-    s += '.';
-    s += static_cast<char>('0' + sixths % 6);
-    s += suffix;
-    return s;
+    std::string whole = toSenary(sixths / 6);
+    if (whole.size() >= 4) {
+        // four whole digits: round to whole units, no radix digit
+        uint64_t units = static_cast<uint64_t>(std::llround(v / static_cast<double>(base)));
+        if (suffix == 'U' && units >= UNEXIAN) return "1.0B"; // rounded across the boundary
+        return toSenary(units) + suffix;
+    }
+    return whole + '.' + static_cast<char>('0' + sixths % 6) + suffix;
 }
 
 // --- pernif math ----------------------------------------------------------
@@ -191,12 +214,6 @@ static int savedPercentForPernif(int wholePernif) {
 
 static bool isLegalSavedPercent(int p) {
     return savedPercentForPernif(pernifFromSavedPercent(p)) == p;
-}
-
-static int normalizeSavedPercent(int p) {
-    if (isLegalSavedPercent(p)) return p;
-    int whole = static_cast<int>(std::floor(p * 36.0 / 100.0 + 1e-9));
-    return savedPercentForPernif(whole);
 }
 
 // Whole-pernif display for an integer percent of unknown provenance:
@@ -427,6 +444,27 @@ static bool matchSenaryQuartets(std::string const& in, size_t i, size_t& end) {
     return true;
 }
 
+// Already-converted senary abbreviation ("274.4U", "2412U", "1.0B"):
+// pass through verbatim. Without this, a recycled TableView cell can feed
+// this mod's own output back in, and the whole part gets digit-converted a
+// second time ("274.4U" -> "1134.4U").
+static bool matchSenaryAbbrevToken(std::string const& in, size_t i, size_t& end) {
+    size_t const n = in.size();
+    size_t p = i;
+    size_t wholeLen = 0;
+    while (p < n && in[p] >= '0' && in[p] <= '5') { ++p; ++wholeLen; }
+    if (wholeLen == 0 || wholeLen > 4) return false;
+    if (p < n && in[p] == '.') {
+        if (p + 1 >= n || in[p + 1] < '0' || in[p + 1] > '5') return false;
+        p += 2;
+    }
+    if (p >= n || (in[p] != 'U' && in[p] != 'B')) return false;
+    if (p + 1 < n && std::isalnum(static_cast<unsigned char>(in[p + 1]))) return false;
+    if (i > 0 && std::isalnum(static_cast<unsigned char>(in[i - 1]))) return false;
+    end = p + 1;
+    return true;
+}
+
 // Decimal comma-grouped number: \d{1,3}(,\d{3})+ with standalone boundaries.
 static bool matchCommaNumber(std::string const& in, size_t i, uint64_t& value, size_t& end) {
     size_t const n = in.size();
@@ -553,12 +591,58 @@ static bool matchPercentToken(std::string const& in, size_t i, std::string& out,
     if (frac) {
         out = formatPernif(value, true);
     } else {
-        int whole = displayPernifForPercent(static_cast<int>(std::llround(value)));
+        int p = static_cast<int>(std::llround(value));
+        int whole = s_floorPercentTokens
+            ? (p >= 100 ? 36 : static_cast<int>(std::floor(p * 36.0 / 100.0 + 1e-9)))
+            : displayPernifForPercent(p);
         out = toSenary(static_cast<uint64_t>(whole)) + "%";
     }
     (void)intEnd;
     end = p + 1;
     return true;
+}
+
+// Tag-aware conversion for GD tagged strings (alert descriptions). GD's
+// convention colors proper nouns — level names, player names — with tags
+// (<cy>..</c>) while game text and its numbers sit untagged. So: outside
+// tags, full conversion; inside tags, only word/phrase replacement, never
+// digit conversion — a tagged "100 Ways" keeps its digits, a tagged
+// "Percentage" still becomes "Pernifage". Tags themselves copy verbatim.
+static std::string convertText(std::string const& in);
+static std::string convertTaggedText(std::string const& in) {
+    std::string out;
+    out.reserve(in.size() + 8);
+    size_t i = 0;
+    size_t const n = in.size();
+    bool insideTag = false;
+    size_t segStart = 0;
+    auto flush = [&](size_t endPos) {
+        if (endPos <= segStart) return;
+        std::string seg = in.substr(segStart, endPos - segStart);
+        if (insideTag) {
+            replacePhrases(seg);
+            replacePercentWords(seg);
+            out += seg;
+        } else {
+            out += convertText(seg);
+        }
+    };
+    while (i < n) {
+        if (in[i] == '<') {
+            size_t close = in.find('>', i);
+            if (close == std::string::npos) break;
+            flush(i);
+            bool closing = close > i + 1 && in[i + 1] == '/';
+            out += in.substr(i, close - i + 1); // the tag, verbatim
+            insideTag = !closing;
+            i = close + 1;
+            segStart = i;
+        } else {
+            ++i;
+        }
+    }
+    flush(n);
+    return out;
 }
 
 static std::string convertText(std::string const& in) {
@@ -575,6 +659,11 @@ static std::string convertText(std::string const& in) {
                 continue;
             }
             if (matchSenaryQuartets(in, i, end)) {
+                out += in.substr(i, end - i);
+                i = end;
+                continue;
+            }
+            if (matchSenaryAbbrevToken(in, i, end)) {
                 out += in.substr(i, end - i);
                 i = end;
                 continue;
@@ -661,6 +750,7 @@ static std::string process(CCLabelBMFont* label, char const* raw) {
         s_lastOutput[label] = in;
         return in;
     }
+    if (s_userContentScope || s_preconvertedScope) return in;
     if (insideTextInput(label)) return in;
     if (isUserContent(label)) return in;
     auto it = s_lastOutput.find(label);
@@ -676,6 +766,35 @@ static void setSenaryString(CCLabelBMFont* label, std::string const& s) {
     label->setString(s.c_str());
     s_bypass = false;
     flipPernifGlyphs(label, s);
+}
+
+// Recenter a horizontal group of sibling nodes (labels + icons sharing the
+// given node's row) on the parent's horizontal midpoint. Used where a
+// converted label's width change unbalances a vanilla-centered pair.
+static void recenterLabelRow(CCNode* member) {
+    if (!member) return;
+    auto* parent = member->getParent();
+    if (!parent) return;
+    float pw = parent->getContentSize().width;
+    if (pw <= 0) return;
+    float y0 = member->getPositionY();
+    std::vector<CCNode*> row;
+    float lo = 1e9f, hi = -1e9f;
+    auto* children = parent->getChildren();
+    if (!children) return;
+    for (int i = 0; i < static_cast<int>(parent->getChildrenCount()); ++i) {
+        auto* n = static_cast<CCNode*>(children->objectAtIndex(i));
+        if (!n || !n->isVisible()) continue;
+        if (std::fabs(n->getPositionY() - y0) > 10.f) continue;
+        auto bb = n->boundingBox();
+        lo = std::min(lo, bb.getMinX());
+        hi = std::max(hi, bb.getMaxX());
+        row.push_back(n);
+    }
+    if (row.size() < 2 || hi <= lo) return;
+    float shift = pw / 2.f - (lo + hi) / 2.f;
+    if (std::fabs(shift) < 0.5f) return;
+    for (auto* n : row) n->setPositionX(n->getPositionX() + shift);
 }
 
 // One-shot conversion sweep over a subtree, for text set through paths the
@@ -828,6 +947,28 @@ class $modify(SenaryCounterLabel, CCCounterLabel) {
     }
 };
 
+// Tagged alert popups: GD color tags (<cg>..</c>) are resolved to
+// per-character index ranges BEFORE the inner labels exist, so converting
+// the text afterward lengthens it and the stored ranges bleed onto the
+// wrong characters (trailing digits picking up the next label's color).
+// Converting the description up front, before tag parsing, keeps every
+// range aligned; inner label hooks then pass the text through untouched.
+class $modify(SenaryFLAlertLayer, FLAlertLayer) {
+    static FLAlertLayer* create(FLAlertLayerProtocol* delegate, char const* title,
+                                gd::string desc, char const* btn1, char const* btn2,
+                                float width, bool scroll, float height, float textScale) {
+        if (!senary::enabled())
+            return FLAlertLayer::create(delegate, title, desc, btn1, btn2,
+                                        width, scroll, height, textScale);
+        std::string converted = senary::convertTaggedText(desc);
+        senary::s_preconvertedScope = true;
+        auto* layer = FLAlertLayer::create(delegate, title, gd::string(converted),
+                                           btn1, btn2, width, scroll, height, textScale);
+        senary::s_preconvertedScope = false;
+        return layer;
+    }
+};
+
 // --- targeted semantic hooks ----------------------------------------------
 
 class $modify(SenaryPlayLayer, PlayLayer) {
@@ -899,22 +1040,33 @@ class $modify(SenaryPlayLayer, PlayLayer) {
             // restoring exactly what was stored at attempt start.
             writeActiveBest(m_isPracticeMode ? m_fields->attemptStoredPractice
                                              : m_fields->attemptStoredNormal);
+            // Vanilla already committed to the longer new-best respawn
+            // delay upstream; replace the pending delayed reset with the
+            // normal-death timing. Experimental: touches respawn flow.
+            if (Mod::get()->getSettingValue<bool>("fast-suppressed-respawn")) {
+                Ref<PlayLayer> self(static_cast<PlayLayer*>(this));
+                Loader::get()->queueInMainThread([self] {
+                    self->unschedule(schedule_selector(PlayLayer::delayedResetLevel));
+                    self->scheduleOnce(schedule_selector(PlayLayer::delayedResetLevel), 0.5f);
+                });
+            }
             return;
         }
         m_fields->bestWholePernif = wholeNow;
         // Snap the freshly written raw percent to the legal floored value —
         // the only place saves are ever rewritten.
         writeActiveBest(senary::savedPercentForPernif(wholeNow));
-        // The popup's percent tokens are rescaled by the global pernif rule.
+        // Popup percent tokens are raw currents: floor them unconditionally.
+        senary::s_floorPercentTokens = true;
         PlayLayer::showNewBest(newReward, orbs, diamonds, demonKey, noRetry, noTitle);
+        senary::s_floorPercentTokens = false;
     }
 };
 
 // Level page: pernifage bars, exact counts, hidden orbs, name restores,
 // row repack.
 class $modify(SenaryLevelInfoLayer, LevelInfoLayer) {
-    void setupProgressBars() {
-        LevelInfoLayer::setupProgressBars();
+    void scheduleFixups() {
         if (!senary::enabled() || !m_level) return;
         Ref<LevelInfoLayer> self(this);
         Loader::get()->queueInMainThread([self] {
@@ -969,6 +1121,19 @@ class $modify(SenaryLevelInfoLayer, LevelInfoLayer) {
                     senary::restoreLabel(senary::findLabelIn(creatorBtn), "By " + name);
             }
         });
+    }
+
+    void setupProgressBars() {
+        LevelInfoLayer::setupProgressBars();
+        scheduleFixups();
+    }
+
+    // A freshly downloaded level builds its stats row (orbs included) only
+    // when the download completes — after setup already ran, so the hide
+    // found nothing to hide. Re-apply everything when the download lands.
+    void levelDownloadFinished(GJGameLevel* level) {
+        LevelInfoLayer::levelDownloadFinished(level);
+        scheduleFixups();
     }
 };
 
@@ -1069,9 +1234,35 @@ class $modify(SenaryLevelCell, LevelCell) {
 
 // Comment metadata inside the CommentCell exemption: percentage badge,
 // like count, and date digits re-convert; comment text and username stay.
+// Level leaderboard cells: other players' percents read as the bottom of
+// their interval (13% -> 4 pernif). The current account's own rows are
+// exempt — they are this mod's legal floored saves and recover via the
+// standard legal-save rule, matching the level page. Local score cells
+// carry raw attempt percents, so bottom reading applies to all of those.
+// (GJScoreCell itself is the stars leaderboard — no percents there.)
+class $modify(SenaryLevelScoreCell, GJLevelScoreCell) {
+    void loadFromScore(GJUserScore* score) {
+        bool own = score &&
+            score->m_accountID == GJAccountManager::sharedState()->m_accountID;
+        senary::s_floorPercentTokens = !own;
+        GJLevelScoreCell::loadFromScore(score);
+        senary::s_floorPercentTokens = false;
+    }
+};
+
+class $modify(SenaryLocalLevelScoreCell, GJLocalLevelScoreCell) {
+    void loadFromScore(GJLocalScore* score) {
+        senary::s_floorPercentTokens = true;
+        GJLocalLevelScoreCell::loadFromScore(score);
+        senary::s_floorPercentTokens = false;
+    }
+};
+
 class $modify(SenaryCommentCell, CommentCell) {
     void loadFromComment(GJComment* comment) {
+        senary::s_userContentScope = true;
         CommentCell::loadFromComment(comment);
+        senary::s_userContentScope = false;
         if (!senary::enabled() || !comment) return;
         int percent = comment->m_percentage;
         int likes = comment->m_likeCount;
@@ -1123,7 +1314,7 @@ class $modify(SenaryDailyLevelPage, DailyLevelPage) {
     // is nothing to flicker against. Unit-format output ("1days 22h") has
     // no standalone digit runs, so the global hook leaves it alone.
     gd::string getDailyTimeString(int timeLeft) {
-        if (!senary::enabled())
+        if (!senary::enabled() || m_type == GJTimedLevelType::Event)
             return DailyLevelPage::getDailyTimeString(timeLeft);
         m_fields->lastReportedSeconds = timeLeft;
         m_fields->sinceReport = 0.0;
@@ -1134,7 +1325,8 @@ class $modify(SenaryDailyLevelPage, DailyLevelPage) {
     // remaining), so T6-second boundaries land on time in the final stretch.
     void updateTimers(float dt) {
         DailyLevelPage::updateTimers(dt);
-        if (!senary::enabled()) return;
+        if (!senary::enabled() || m_type == GJTimedLevelType::Event) return;
+        senary::recenterLabelRow(m_timeLabel);
         if (m_fields->lastReportedSeconds < 0 || !m_timeLabel) return;
         m_fields->sinceReport += dt;
         double remaining = static_cast<double>(m_fields->lastReportedSeconds) - m_fields->sinceReport;
@@ -1256,7 +1448,136 @@ class $modify(SenaryEditLevelLayer, EditLevelLayer) {
     }
 };
 
+// Treasure Room: chest key counts arrive through unhooked paths. The
+// layer's init is not in the bindings, so the static scene() is hooked and
+// the constructed scene swept one frame later.
+class $modify(SenarySecretRewardsLayer, SecretRewardsLayer) {
+    static cocos2d::CCScene* scene(bool fromShop) {
+        auto* sc = SecretRewardsLayer::scene(fromShop);
+        if (senary::enabled() && sc) {
+            Ref<cocos2d::CCScene> ref(sc);
+            Loader::get()->queueInMainThread([ref] {
+                senary::sweepConvertLabels(ref);
+            });
+        }
+        return sc;
+    }
+};
+
+// List reward diamonds: converted three-digit counts overflowed left out of
+// the box; recenter the count+icon group after conversion.
+class $modify(SenaryLevelListLayer, LevelListLayer) {
+    bool init(GJLevelList* list) {
+        if (!LevelListLayer::init(list)) return false;
+        if (!senary::enabled()) return true;
+        Ref<LevelListLayer> self(this);
+        Loader::get()->queueInMainThread([self] {
+            for (char const* id : { "diamonds-count", "small-diamonds-count" }) {
+                if (auto* count = self->getChildByIDRecursive(id))
+                    senary::recenterLabelRow(count);
+            }
+        });
+        return true;
+    }
+};
+
+// Six levels per page: any browser page delivering more than six items is
+// sliced client-side. Next/prev walk the cached slice first and only fall
+// through to vanilla paging (at most one new server fetch) when the cache
+// is exhausted — six never exceeds the server page, so no screen needs two
+// fetches. Page-range text still reflects server pages; cosmetic for now.
 class $modify(SenaryLevelBrowserLayer, LevelBrowserLayer) {
+    struct Fields {
+        Ref<cocos2d::CCArray> fullPage;
+        int subPage = 0;
+        int serverStart = -1; // absolute index of the cached page's first item
+        bool enterAtLastSub = false;
+        bool reslicing = false;
+    };
+
+    // Parse the leading senary number of the vanilla-written page text
+    // ("105 to 122") back to the decimal absolute start index.
+    int parsePageStart() {
+        if (!m_pageText || !m_pageText->getString()) return -1;
+        std::string cur = m_pageText->getString();
+        size_t i = 0;
+        while (i < cur.size() && !std::isdigit(static_cast<unsigned char>(cur[i]))) ++i;
+        long v = 0;
+        bool any = false;
+        for (; i < cur.size(); ++i) {
+            char c = cur[i];
+            if (c == ',') continue;
+            if (c < '0' || c > '5') break;
+            v = v * 6 + (c - '0');
+            any = true;
+        }
+        return any ? static_cast<int>(v) : -1;
+    }
+
+    static constexpr int PER_PAGE = 6;
+
+    void showSlice() {
+        auto* full = m_fields->fullPage.data();
+        if (!full) return;
+        int total = static_cast<int>(full->count());
+        int start = m_fields->subPage * PER_PAGE;
+        auto* slice = cocos2d::CCArray::create();
+        for (int i = start; i < total && i < start + PER_PAGE; ++i)
+            slice->addObject(full->objectAtIndex(i));
+        m_fields->reslicing = true;
+        this->setupLevelBrowser(slice);
+        m_fields->reslicing = false;
+
+        // Correct the page-range text for the sub-slice. The absolute start
+        // is recovered once per cached page from vanilla's own text.
+        if (m_fields->serverStart < 0) m_fields->serverStart = parsePageStart();
+        if (m_fields->serverStart >= 0 && m_pageText) {
+            int a = m_fields->serverStart + start;
+            int b = std::min(m_fields->serverStart + total - 1, a + PER_PAGE - 1);
+            std::string text = std::to_string(a) + " to " + std::to_string(b);
+            m_pageText->setString(text.c_str()); // decimal in, global hook converts
+        }
+    }
+
+    void setupLevelBrowser(cocos2d::CCArray* items) {
+        bool active = senary::enabled() &&
+                      Mod::get()->getSettingValue<bool>("six-per-page");
+        if (!active || m_fields->reslicing || !items ||
+            static_cast<int>(items->count()) <= PER_PAGE) {
+            LevelBrowserLayer::setupLevelBrowser(items);
+            return;
+        }
+        m_fields->fullPage = items;
+        m_fields->serverStart = -1;
+        int subCount = (static_cast<int>(items->count()) + PER_PAGE - 1) / PER_PAGE;
+        m_fields->subPage = m_fields->enterAtLastSub ? subCount - 1 : 0;
+        m_fields->enterAtLastSub = false;
+        showSlice();
+    }
+
+    void onNextPage(cocos2d::CCObject* sender) {
+        auto* full = m_fields->fullPage.data();
+        if (senary::enabled() && full &&
+            (m_fields->subPage + 1) * PER_PAGE < static_cast<int>(full->count())) {
+            ++m_fields->subPage;
+            showSlice();
+            return;
+        }
+        m_fields->fullPage = nullptr;
+        LevelBrowserLayer::onNextPage(sender);
+    }
+
+    void onPrevPage(cocos2d::CCObject* sender) {
+        if (senary::enabled() && m_fields->fullPage.data() && m_fields->subPage > 0) {
+            --m_fields->subPage;
+            showSlice();
+            return;
+        }
+        if (senary::enabled()) m_fields->enterAtLastSub = true;
+        m_fields->fullPage = nullptr;
+        LevelBrowserLayer::onPrevPage(sender);
+    }
+
     void setIDPopupClosed(SetIDPopup* popup, int value) {
         if (senary::enabled()) value = senary::reinterpretTypedAsSenary(value);
         LevelBrowserLayer::setIDPopupClosed(popup, value);
