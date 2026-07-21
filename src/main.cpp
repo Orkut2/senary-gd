@@ -1027,6 +1027,10 @@ class $modify(SenaryPlayLayer, PlayLayer) {
         syncBestTracker();
     }
 
+    void delayedResetLevelWrapper(float) {
+        PlayLayer::delayedResetLevel();
+    }
+
     void showNewBest(bool newReward, int orbs, int diamonds,
                      bool demonKey, bool noRetry, bool noTitle) {
         if (!senary::enabled()) {
@@ -1046,8 +1050,8 @@ class $modify(SenaryPlayLayer, PlayLayer) {
             if (Mod::get()->getSettingValue<bool>("fast-suppressed-respawn")) {
                 Ref<PlayLayer> self(static_cast<PlayLayer*>(this));
                 Loader::get()->queueInMainThread([self] {
-                    self->unschedule(schedule_selector(PlayLayer::delayedResetLevel));
-                    self->scheduleOnce(schedule_selector(PlayLayer::delayedResetLevel), 0.5f);
+                    self->unschedule(schedule_selector(SenaryPlayLayer::delayedResetLevelWrapper));
+                    self->scheduleOnce(schedule_selector(SenaryPlayLayer::delayedResetLevelWrapper), 0.5f);
                 });
             }
             return;
